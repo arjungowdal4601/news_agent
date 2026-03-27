@@ -7,10 +7,11 @@ This project should take a fixed list of automotive news site URLs, download eac
 1. Update the source list and cutoff date in `sitemap_recent_filter.py` when needed.
 2. Run `python sitemap_recent_filter.py`.
 3. The script downloads each top-level sitemap into `downloaded_sitemaps/`.
-4. The script recursively walks `sitemapindex` and `urlset` XML structures.
-5. URLs are kept only when `lastmod` is on or after the configured cutoff date.
-6. Per-site CSV files and a combined Excel workbook are written to `recent_sitemap_outputs/`.
-7. If one site fails to download, the script logs the error and continues with the rest.
+4. The script uses `requests` first and falls back to a browser-impersonated client when a site blocks normal HTTP requests or serves a browser challenge page instead of XML.
+5. The script recursively walks `sitemapindex` and `urlset` XML structures.
+6. URLs are kept only when `lastmod` is on or after the configured cutoff date.
+7. Per-site CSV files and a combined Excel workbook are written to `recent_sitemap_outputs/`.
+8. If one site fails to download, the script logs the error and continues with the rest.
 
 ## Active Sources
 - `https://www.motortrend.com/`
@@ -20,6 +21,7 @@ This project should take a fixed list of automotive news site URLs, download eac
 
 ## Important Files
 - `sitemap_recent_filter.py`: Main automation script.
+- `requirements.txt`: Minimal Python dependencies for the project.
 - `vision.md`: Project workflow and change log. Update this whenever code or process changes.
 - `downloaded_sitemaps/`: Runtime download folder created automatically.
 - `recent_sitemap_outputs/`: Runtime output folder created automatically.
@@ -33,8 +35,8 @@ Always update:
 - `Important Files`
 - `Change Log`
 
-## Known Issue
-- On March 26, 2026, `https://www.spglobal.com/automotive-insights/en/sitemap.xml` returned HTTP 403 from this environment. The script now skips that site without stopping the full run.
+## Known Behavior
+- Some sites may return HTTP 403 or a 200 HTML browser-challenge page to plain `requests` traffic. The script retries those downloads with a browser-impersonated client.
 
 ## Change Log
 
@@ -44,3 +46,5 @@ Always update:
 - Simplified the project so the script is the main source of truth for the workflow.
 - Added `.gitignore` so generated downloads and outputs do not clutter the repo.
 - Added this `vision.md` file as the project working note and update log.
+- Added a compact fallback for Akamai-blocked sites like `spglobal.com` using `curl_cffi`.
+- Extended the fallback so HTML challenge pages are retried too, not just HTTP 403 responses.

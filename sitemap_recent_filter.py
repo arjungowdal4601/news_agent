@@ -1,10 +1,5 @@
 from __future__ import annotations
 
-"""
-Download top-level sitemap files, expand child sitemaps, filter recent URLs,
-and export the results to CSV and Excel.
-"""
-
 import csv
 import gzip
 import re
@@ -12,41 +7,32 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Optional
 from urllib.parse import urlparse
 
 import requests
 from openpyxl import Workbook
-from openpyxl.worksheet.worksheet import Worksheet
 
+try:
+    from curl_cffi import requests as curl_requests
+except ImportError:
+    curl_requests = None
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
-PROJECT_DIR = Path(__file__).resolve().parent
-DOWNLOAD_DIR = PROJECT_DIR / "downloaded_sitemaps"
-OUTPUT_DIR = PROJECT_DIR / "recent_sitemap_outputs"
+ROOT = Path(__file__).resolve().parent
+DOWNLOAD_DIR = ROOT / "downloaded_sitemaps"
+OUTPUT_DIR = ROOT / "recent_sitemap_outputs"
 EXCEL_PATH = OUTPUT_DIR / "recent_urls.xlsx"
-
 BASE_URLS = [
     "https://www.motortrend.com/",
     "https://www.autonews.com/",
     "https://www.spglobal.com/automotive-insights/en",
     "https://www.automotiveworld.com/",
 ]
-
-# Keep this empty unless you intentionally want to process local XML files
-# alongside the downloaded top-level sitemap files.
-MANUAL_INPUT_FILES: tuple[str, ...] = ()
-
-CUTOFF_DATE_TEXT = "2026-02-20"
+CUTOFF_DATE_TEXT = "2025-02-20"
 KEEP_URLS_WITHOUT_LASTMOD = False
-REQUEST_TIMEOUT_SECONDS = 60
-EXCEL_MAX_DATA_ROWS = 1_048_575
-OUTPUT_COLUMNS = ("link", "lastmod")
-DEFAULT_NAMESPACE = "http://www.sitemaps.org/schemas/sitemap/0.9"
-DATE_IN_URL_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
-
+TIMEOUT = 60
+MAX_EXCEL_ROWS = 1_048_575
+NS = "http://www.sitemaps.org/schemas/sitemap/0.9"
+DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -56,364 +42,175 @@ HEADERS = {
 
 
 @dataclass
-class ProcessStats:
+class Stats:
     csv_rows: int = 0
     excel_rows: int = 0
-    excel_truncated: bool = False
-    expanded_child_sitemaps: int = 0
-    skipped_child_sitemaps: int = 0
+    expanded: int = 0
+    skipped: int = 0
+    truncated: bool = False
 
 
-# ============================================================
-# SETUP HELPERS
-# ============================================================
-def ensure_runtime_directories() -> None:
-    """Create the runtime folders used by the pipeline."""
-    DOWNLOAD_DIR.mkdir(exist_ok=True)
-    OUTPUT_DIR.mkdir(exist_ok=True)
-
-
-def create_workbook() -> Workbook:
-    """Create an empty workbook that will receive one sheet per sitemap."""
-    workbook = Workbook()
-    workbook.remove(workbook.active)
-    return workbook
-
-
-# ============================================================
-# DATE HELPERS
-# ============================================================
-def to_date(value: str) -> Optional[date]:
-    """Convert common sitemap date formats into a Python date."""
-    if not value:
-        return None
-
-    text = value.strip()
+def to_date(text: str) -> date | None:
+    text = text.strip() if text else ""
     if not text:
         return None
-
-    if len(text) >= 10:
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
         try:
-            return date.fromisoformat(text[:10])
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
         except ValueError:
-            pass
-
-    try:
-        normalized = text.replace("Z", "+00:00")
-        return datetime.fromisoformat(normalized).date()
-    except ValueError:
-        return None
+            return None
 
 
-def extract_date_from_url(url: str) -> Optional[date]:
-    """Read a date from a child sitemap URL when the parent lacks lastmod."""
-    match = DATE_IN_URL_RE.search(url)
-    if not match:
-        return None
-
-    try:
-        return date.fromisoformat(match.group(1))
-    except ValueError:
-        return None
+def date_in_url(url: str) -> date | None:
+    match = DATE_RE.search(url)
+    return to_date(match.group(1)) if match else None
 
 
-# ============================================================
-# XML HELPERS
-# ============================================================
-def strip_namespace(tag: str) -> str:
-    """Remove an XML namespace prefix from a tag name."""
-    return tag.split("}", 1)[-1] if "}" in tag else tag
-
-
-def get_namespace(root: ET.Element) -> dict[str, str]:
-    """Return the namespace mapping needed for ElementTree lookups."""
-    if root.tag.startswith("{"):
-        return {"sm": root.tag.split("}", 1)[0][1:]}
-    return {"sm": DEFAULT_NAMESPACE}
-
-
-def get_child_text(parent: ET.Element, tag_name: str, namespace: dict[str, str]) -> str:
-    """Safely read text from a direct child node."""
-    node = parent.find(f"sm:{tag_name}", namespace)
-    if node is None or node.text is None:
-        return ""
-    return node.text.strip()
-
-
-def parse_xml_bytes(content: bytes, source_name: str = "") -> ET.Element:
-    """Parse XML bytes and transparently handle gzip-compressed sitemaps."""
-    is_gzip = source_name.lower().endswith(".gz") or content[:2] == b"\x1f\x8b"
-    if is_gzip:
+def xml_root(content: bytes, source: str = "") -> ET.Element:
+    if source.lower().endswith(".gz") or content[:2] == b"\x1f\x8b":
         try:
             content = gzip.decompress(content)
         except OSError:
             pass
-
-    text = content.decode("utf-8-sig", errors="replace").strip()
-    return ET.fromstring(text)
+    return ET.fromstring(content.decode("utf-8-sig", errors="replace").strip())
 
 
-# ============================================================
-# NETWORK HELPERS
-# ============================================================
-def build_sitemap_url(base_url: str) -> str:
-    """Turn a base site URL into its top-level sitemap.xml URL."""
-    return base_url.rstrip("/") + "/sitemap.xml"
+def ns(root: ET.Element) -> dict[str, str]:
+    return {"sm": root.tag.split("}", 1)[0][1:] if root.tag.startswith("{") else NS}
 
 
-def build_download_file_name(base_url: str) -> str:
-    """Create a stable local filename for a downloaded top-level sitemap."""
-    parsed = urlparse(base_url)
-    raw_name = f"{parsed.netloc}{parsed.path}".strip("/")
-    safe_name = "".join(ch if ch.isalnum() else "_" for ch in raw_name).strip("_")
-    return f"{safe_name or 'sitemap'}_sitemap.xml"
+def text(node: ET.Element, tag: str, namespace: dict[str, str]) -> str:
+    child = node.find(f"sm:{tag}", namespace)
+    return child.text.strip() if child is not None and child.text else ""
+
+
+def is_xml_response(response) -> bool:
+    body = response.content.lstrip()
+    if body.startswith(b"\xef\xbb\xbf"):
+        body = body[3:]
+    return body[:32].lower().startswith((b"<?xml", b"<urlset", b"<sitemapindex"))
 
 
 def fetch_bytes(url: str, session: requests.Session) -> bytes:
-    """Download raw bytes from a sitemap URL."""
-    response = session.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
+    response = session.get(url, timeout=TIMEOUT)
+    if response.ok and is_xml_response(response):
+        return response.content
+
+    if curl_requests is None:
+        response.raise_for_status()
+        return response.content
+
+    response = curl_requests.get(url, headers=dict(session.headers), impersonate="chrome136", timeout=TIMEOUT)
     response.raise_for_status()
     return response.content
 
 
-def fetch_remote_root(url: str, session: requests.Session) -> ET.Element:
-    """Download and parse a remote child sitemap."""
-    return parse_xml_bytes(fetch_bytes(url, session), source_name=url)
+def file_name(base_url: str) -> str:
+    parsed = urlparse(base_url)
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", f"{parsed.netloc}{parsed.path}").strip("_")
+    return f"{slug or 'sitemap'}_sitemap.xml"
 
 
-def download_top_level_sitemap(base_url: str, session: requests.Session) -> Path:
-    """Download one site's top-level sitemap.xml to disk."""
-    sitemap_url = build_sitemap_url(base_url)
-    download_path = DOWNLOAD_DIR / build_download_file_name(base_url)
-    download_path.write_bytes(fetch_bytes(sitemap_url, session))
-    print(f"[FETCH] {sitemap_url} -> {download_path}")
-    return download_path
+def keep_url(lastmod: str, cutoff: date) -> bool:
+    parsed = to_date(lastmod)
+    return KEEP_URLS_WITHOUT_LASTMOD if parsed is None else parsed >= cutoff
 
 
-def collect_input_files(session: requests.Session) -> list[Path]:
-    """Build the list of top-level sitemap files to process."""
-    input_files: list[Path] = []
-
-    for base_url in BASE_URLS:
-        try:
-            input_files.append(download_top_level_sitemap(base_url, session))
-        except Exception as exc:
-            print(f"[ERROR] Failed to download sitemap for {base_url}: {exc}")
-
-    for file_name in MANUAL_INPUT_FILES:
-        file_path = PROJECT_DIR / file_name
-        if not file_path.exists():
-            print(f"[SKIP] File not found: {file_path}")
-            continue
-        input_files.append(file_path)
-
-    return input_files
+def expand_child(child_url: str, parent_lastmod: str, cutoff: date) -> bool:
+    return (to_date(parent_lastmod) or date_in_url(child_url) or cutoff) >= cutoff
 
 
-# ============================================================
-# OUTPUT HELPERS
-# ============================================================
-def safe_stem(name: str) -> str:
-    """Create a filesystem-safe output stem."""
-    raw_stem = Path(name).stem
-    safe_stem_name = "".join(
-        ch if ch.isalnum() or ch in ("-", "_") else "_"
-        for ch in raw_stem
-    ).strip("_")
-    return safe_stem_name or "output"
-
-
-def safe_sheet_name(name: str) -> str:
-    """Create an Excel-safe worksheet name."""
-    cleaned_name = name
-    for character in ['\\', '/', '*', '[', ']', ':', '?']:
-        cleaned_name = cleaned_name.replace(character, "_")
-    return cleaned_name[:31]
-
-
-def write_result_row(
-    link: str,
-    lastmod: str,
-    csv_writer: csv.DictWriter,
-    worksheet: Worksheet,
-    stats: ProcessStats,
-) -> None:
-    """Write one filtered URL to the CSV and Excel outputs."""
-    csv_writer.writerow({"link": link, "lastmod": lastmod})
+def write_row(writer: csv.DictWriter, sheet, stats: Stats, link: str, lastmod: str) -> None:
+    writer.writerow({"link": link, "lastmod": lastmod})
     stats.csv_rows += 1
-
-    if stats.excel_rows < EXCEL_MAX_DATA_ROWS:
-        worksheet.append([link, lastmod])
+    if stats.excel_rows < MAX_EXCEL_ROWS:
+        sheet.append([link, lastmod])
         stats.excel_rows += 1
     else:
-        stats.excel_truncated = True
+        stats.truncated = True
 
 
-# ============================================================
-# FILTERING RULES
-# ============================================================
-def should_keep_final_url(lastmod_text: str, cutoff_date: date) -> bool:
-    """Keep a final URL when its lastmod date is on or after the cutoff."""
-    lastmod_date = to_date(lastmod_text)
-    if lastmod_date is None:
-        return KEEP_URLS_WITHOUT_LASTMOD
-    return lastmod_date >= cutoff_date
+def walk(root: ET.Element, session: requests.Session, cutoff: date, writer: csv.DictWriter, sheet, stats: Stats, seen: set[str]) -> None:
+    namespace = ns(root)
+    kind = root.tag.split("}", 1)[-1]
 
-
-def should_expand_child_sitemap(
-    child_url: str,
-    parent_lastmod_text: str,
-    cutoff_date: date,
-) -> bool:
-    """
-    Decide whether a child sitemap is worth opening.
-
-    Order of checks:
-    1. Parent sitemap lastmod
-    2. Date embedded in the child sitemap URL
-    3. Expand anyway if there is not enough metadata to skip safely
-    """
-    parent_lastmod_date = to_date(parent_lastmod_text)
-    if parent_lastmod_date is not None:
-        return parent_lastmod_date >= cutoff_date
-
-    child_date_from_url = extract_date_from_url(child_url)
-    if child_date_from_url is not None:
-        return child_date_from_url >= cutoff_date
-
-    return True
-
-
-# ============================================================
-# CORE WALKER
-# ============================================================
-def walk_sitemap(
-    root: ET.Element,
-    session: requests.Session,
-    cutoff_date: date,
-    csv_writer: csv.DictWriter,
-    worksheet: Worksheet,
-    stats: ProcessStats,
-    visited_sitemaps: set[str],
-) -> None:
-    """Recursively process either a urlset or a sitemapindex."""
-    namespace = get_namespace(root)
-    root_type = strip_namespace(root.tag)
-
-    if root_type == "urlset":
-        for url_node in root.findall("./sm:url", namespace):
-            link = get_child_text(url_node, "loc", namespace)
-            lastmod = get_child_text(url_node, "lastmod", namespace)
-
-            if link and should_keep_final_url(lastmod, cutoff_date):
-                write_result_row(link, lastmod, csv_writer, worksheet, stats)
+    if kind == "urlset":
+        for node in root.findall("./sm:url", namespace):
+            link, lastmod = text(node, "loc", namespace), text(node, "lastmod", namespace)
+            if link and keep_url(lastmod, cutoff):
+                write_row(writer, sheet, stats, link, lastmod)
         return
 
-    if root_type == "sitemapindex":
-        for sitemap_node in root.findall("./sm:sitemap", namespace):
-            child_url = get_child_text(sitemap_node, "loc", namespace)
-            parent_lastmod = get_child_text(sitemap_node, "lastmod", namespace)
+    if kind != "sitemapindex":
+        raise ValueError(f"Unsupported sitemap root tag: {root.tag}")
 
-            if not child_url or child_url in visited_sitemaps:
-                continue
-
-            if not should_expand_child_sitemap(child_url, parent_lastmod, cutoff_date):
-                stats.skipped_child_sitemaps += 1
-                continue
-
-            visited_sitemaps.add(child_url)
-            stats.expanded_child_sitemaps += 1
-
-            try:
-                child_root = fetch_remote_root(child_url, session)
-                walk_sitemap(
-                    root=child_root,
-                    session=session,
-                    cutoff_date=cutoff_date,
-                    csv_writer=csv_writer,
-                    worksheet=worksheet,
-                    stats=stats,
-                    visited_sitemaps=visited_sitemaps,
-                )
-            except Exception as exc:
-                print(f"[WARN] Could not open child sitemap: {child_url} -> {exc}")
-        return
-
-    raise ValueError(f"Unsupported sitemap root tag: {root.tag}")
+    for node in root.findall("./sm:sitemap", namespace):
+        child_url, parent_lastmod = text(node, "loc", namespace), text(node, "lastmod", namespace)
+        if not child_url or child_url in seen:
+            continue
+        if not expand_child(child_url, parent_lastmod, cutoff):
+            stats.skipped += 1
+            continue
+        seen.add(child_url)
+        stats.expanded += 1
+        try:
+            walk(xml_root(fetch_bytes(child_url, session), child_url), session, cutoff, writer, sheet, stats, seen)
+        except Exception as exc:
+            print(f"[WARN] Could not open child sitemap: {child_url} -> {exc}")
 
 
-# ============================================================
-# TOP-LEVEL PROCESSING
-# ============================================================
-def process_top_level_file(
-    file_path: Path,
-    workbook: Workbook,
-    session: requests.Session,
-    cutoff_date: date,
-) -> None:
-    """Process one top-level sitemap file and export filtered results."""
-    output_stem = safe_stem(file_path.name)
-    csv_path = OUTPUT_DIR / f"{output_stem}_after_{cutoff_date.isoformat()}.csv"
+def process_file(path: Path, workbook: Workbook, session: requests.Session, cutoff: date) -> None:
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "_", path.stem).strip("_") or "output"
+    csv_path = OUTPUT_DIR / f"{stem}_after_{cutoff.isoformat()}.csv"
+    sheet = workbook.create_sheet(title=stem[:31])
+    sheet.append(["link", "lastmod"])
+    stats = Stats()
 
-    worksheet = workbook.create_sheet(title=safe_sheet_name(output_stem))
-    worksheet.append(list(OUTPUT_COLUMNS))
-
-    stats = ProcessStats()
-    visited_sitemaps: set[str] = set()
-    root = parse_xml_bytes(file_path.read_bytes(), source_name=file_path.name)
-
-    with csv_path.open("w", newline="", encoding="utf-8") as output_file:
-        writer = csv.DictWriter(output_file, fieldnames=list(OUTPUT_COLUMNS))
+    with csv_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=["link", "lastmod"])
         writer.writeheader()
-        walk_sitemap(
-            root=root,
-            session=session,
-            cutoff_date=cutoff_date,
-            csv_writer=writer,
-            worksheet=worksheet,
-            stats=stats,
-            visited_sitemaps=visited_sitemaps,
-        )
+        walk(xml_root(path.read_bytes(), path.name), session, cutoff, writer, sheet, stats, set())
 
-    print(
-        f"[DONE] {file_path.name} -> rows={stats.csv_rows}, "
-        f"expanded_child_sitemaps={stats.expanded_child_sitemaps}, "
-        f"skipped_child_sitemaps={stats.skipped_child_sitemaps}"
-    )
+    print(f"[DONE] {path.name} -> rows={stats.csv_rows}, expanded_child_sitemaps={stats.expanded}, skipped_child_sitemaps={stats.skipped}")
     print(f"       CSV saved to: {csv_path}")
-
-    if stats.excel_truncated:
-        print(
-            f"[WARN] Excel sheet for {file_path.name} hit Excel's row limit. "
-            f"Use the CSV as the full output."
-        )
+    if stats.truncated:
+        print(f"[WARN] Excel sheet for {path.name} hit Excel's row limit. Use the CSV as the full output.")
 
 
-# ============================================================
-# MAIN
-# ============================================================
+def download_top_level_sitemaps(session: requests.Session) -> list[Path]:
+    files: list[Path] = []
+    for base_url in BASE_URLS:
+        sitemap_url = base_url.rstrip("/") + "/sitemap.xml"
+        path = DOWNLOAD_DIR / file_name(base_url)
+        try:
+            path.write_bytes(fetch_bytes(sitemap_url, session))
+            print(f"[FETCH] {sitemap_url} -> {path}")
+            files.append(path)
+        except Exception as exc:
+            print(f"[ERROR] Failed to download sitemap for {base_url}: {exc}")
+    return files
+
+
 def main() -> None:
-    ensure_runtime_directories()
-    cutoff_date = date.fromisoformat(CUTOFF_DATE_TEXT)
-    workbook = create_workbook()
+    DOWNLOAD_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    cutoff = date.fromisoformat(CUTOFF_DATE_TEXT)
+    workbook = Workbook()
+    workbook.remove(workbook.active)
 
     with requests.Session() as session:
         session.headers.update(HEADERS)
-        input_files = collect_input_files(session)
-        if not input_files:
-            print("[ERROR] No sitemap files were downloaded or found locally.")
+        files = download_top_level_sitemaps(session)
+        if not files:
+            print("[ERROR] No sitemap files were downloaded.")
             return
-
-        for file_path in input_files:
+        for path in files:
             try:
-                process_top_level_file(
-                    file_path=file_path,
-                    workbook=workbook,
-                    session=session,
-                    cutoff_date=cutoff_date,
-                )
+                process_file(path, workbook, session, cutoff)
             except Exception as exc:
-                print(f"[ERROR] Failed to process {file_path.name}: {exc}")
+                print(f"[ERROR] Failed to process {path.name}: {exc}")
 
     workbook.save(EXCEL_PATH)
     print(f"[DONE] Excel workbook saved to: {EXCEL_PATH}")
