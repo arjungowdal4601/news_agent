@@ -1,0 +1,7 @@
+# Generated runtime files
+downloaded_sitemaps/
+recent_sitemap_outputs/
+
+# Python cache
+__pycache__/
+*.pyc
