@@ -21,12 +21,13 @@ ROOT = Path(__file__).resolve().parent
 DOWNLOAD_DIR = ROOT / "downloaded_sitemaps"
 OUTPUT_DIR = ROOT / "recent_sitemap_outputs"
 EXCEL_PATH = OUTPUT_DIR / "recent_urls.xlsx"
-BASE_URLS = [
-    "https://www.motortrend.com/",
-    "https://www.autonews.com/",
-    "https://www.spglobal.com/automotive-insights/en",
-    "https://www.automotiveworld.com/",
-]
+# BASE_URLS = [
+#     "https://www.motortrend.com/",
+#     "https://www.autonews.com/",
+#     "https://www.spglobal.com/automotive-insights/en",
+#     "https://www.automotiveworld.com/",
+# ]
+BASE_URLS = ["https://www.ndtv.com/"]
 CUTOFF_DATE_TEXT = "2026-03-20"
 KEEP_URLS_WITHOUT_LASTMOD = False
 TIMEOUT = 60

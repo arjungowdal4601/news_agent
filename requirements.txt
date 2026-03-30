@@ -1,3 +1,4 @@
 requests
 openpyxl
 curl_cffi
+crawl4ai
