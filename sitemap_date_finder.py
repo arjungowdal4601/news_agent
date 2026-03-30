@@ -21,14 +21,14 @@ ROOT = Path(__file__).resolve().parent
 DOWNLOAD_DIR = ROOT / "downloaded_sitemaps"
 OUTPUT_DIR = ROOT / "recent_sitemap_outputs"
 EXCEL_PATH = OUTPUT_DIR / "recent_urls.xlsx"
-# BASE_URLS = [
-#     "https://www.motortrend.com/",
-#     "https://www.autonews.com/",
-#     "https://www.spglobal.com/automotive-insights/en",
-#     "https://www.automotiveworld.com/",
-# ]
-BASE_URLS = ["https://www.ndtv.com/"]
-CUTOFF_DATE_TEXT = "2026-03-20"
+BASE_URLS = [
+    "https://www.motortrend.com/",
+    "https://www.autonews.com/",
+    "https://www.spglobal.com/automotive-insights/en",
+    "https://www.automotiveworld.com/",
+]
+
+CUTOFF_DATE_TEXT = "2026-03-25"
 KEEP_URLS_WITHOUT_LASTMOD = False
 TIMEOUT = 60
 MAX_EXCEL_ROWS = 1_048_575
@@ -162,7 +162,7 @@ def walk(root: ET.Element, session: requests.Session, cutoff: date, writer: csv.
             print(f"[WARN] Could not open child sitemap: {child_url} -> {exc}")
 
 
-def process_file(path: Path, workbook: Workbook, session: requests.Session, cutoff: date) -> None:
+def process_file(path: Path, workbook: Workbook, session: requests.Session, cutoff: date) -> tuple[Path, bool]:
     stem = re.sub(r"[^A-Za-z0-9_-]+", "_", path.stem).strip("_") or "output"
     csv_path = OUTPUT_DIR / f"{stem}_after_{cutoff.isoformat()}.csv"
     sheet = workbook.create_sheet(title=stem[:31])
@@ -178,6 +178,7 @@ def process_file(path: Path, workbook: Workbook, session: requests.Session, cuto
     print(f"       CSV saved to: {csv_path}")
     if stats.truncated:
         print(f"[WARN] Excel sheet for {path.name} hit Excel's row limit. Use the CSV as the full output.")
+    return csv_path, stats.truncated
 
 
 def download_top_level_sitemaps(session: requests.Session) -> list[Path]:
@@ -207,14 +208,25 @@ def main() -> None:
         if not files:
             print("[ERROR] No sitemap files were downloaded.")
             return
+        csv_outputs: list[tuple[Path, bool]] = []
         for path in files:
             try:
-                process_file(path, workbook, session, cutoff)
+                csv_outputs.append(process_file(path, workbook, session, cutoff))
             except Exception as exc:
                 print(f"[ERROR] Failed to process {path.name}: {exc}")
 
     workbook.save(EXCEL_PATH)
     print(f"[DONE] Excel workbook saved to: {EXCEL_PATH}")
+
+    for csv_path, truncated in csv_outputs:
+        if truncated:
+            print(f"[KEEP] CSV retained because the Excel sheet was truncated: {csv_path}")
+            continue
+        try:
+            csv_path.unlink(missing_ok=True)
+            print(f"[CLEANUP] Deleted merged CSV: {csv_path}")
+        except Exception as exc:
+            print(f"[WARN] Could not delete CSV {csv_path}: {exc}")
 
 
 if __name__ == "__main__":

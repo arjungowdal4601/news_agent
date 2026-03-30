@@ -6,7 +6,6 @@ import os
 import re
 import sys
 import warnings
-from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -26,6 +25,8 @@ from openpyxl import load_workbook
 OUTPUT_COLUMNS = [
     "markdown_path",
     "scrape_status",
+]
+REMOVED_OUTPUT_COLUMNS = [
     "scraped_at",
     "scrape_error",
     "markdown_type",
@@ -124,6 +125,16 @@ def ensure_output_columns_exist(worksheet, headers: dict[str, int]) -> dict[str,
     return headers
 
 
+def remove_output_columns(worksheet, headers: dict[str, int], column_names: list[str]) -> dict[str, int]:
+    columns_to_delete = sorted(
+        (headers[normalize_header(column_name)] for column_name in column_names if normalize_header(column_name) in headers),
+        reverse=True,
+    )
+    for column_index in columns_to_delete:
+        worksheet.delete_cols(column_index)
+    return read_header_map(worksheet)
+
+
 def resolve_output_dir(excel_path: Path, output_dir_arg: str) -> Path:
     output_dir = Path(output_dir_arg)
     if not output_dir.is_absolute():
@@ -155,18 +166,18 @@ def existing_markdown_file(excel_path: Path, relative_path: str) -> Path | None:
     return file_path if file_path.exists() else None
 
 
-def get_raw_markdown(result) -> tuple[str, str]:
+def get_raw_markdown(result) -> str:
     markdown_value = getattr(result, "markdown", None)
     if markdown_value is None:
         raise RuntimeError("Crawl succeeded but no markdown was returned.")
 
     if hasattr(markdown_value, "raw_markdown"):
-        return str(markdown_value.raw_markdown or ""), "raw_markdown"
+        return str(markdown_value.raw_markdown or "")
 
     if isinstance(markdown_value, str):
-        return markdown_value, "string_markdown"
+        return markdown_value
 
-    return str(markdown_value), type(markdown_value).__name__
+    return str(markdown_value)
 
 
 def build_run_config() -> CrawlerRunConfig:
@@ -180,15 +191,15 @@ def build_run_config() -> CrawlerRunConfig:
     )
 
 
-async def crawl_one_url(crawler: AsyncWebCrawler, url: str, run_config: CrawlerRunConfig) -> tuple[str, str]:
+async def crawl_one_url(crawler: AsyncWebCrawler, url: str, run_config: CrawlerRunConfig) -> str:
     result = await crawler.arun(url=url, config=run_config)
     if not getattr(result, "success", False):
         raise RuntimeError(getattr(result, "error_message", None) or "Crawl4AI reported an unsuccessful crawl.")
 
-    markdown_text, markdown_type = get_raw_markdown(result)
+    markdown_text = get_raw_markdown(result)
     if not markdown_text.strip():
         raise RuntimeError("Crawl succeeded but returned empty markdown.")
-    return markdown_text, markdown_type
+    return markdown_text
 
 
 def save_markdown_file(markdown_text: str, output_dir: Path, url: str, row_number: int) -> Path:
@@ -222,7 +233,9 @@ async def process_rows(args: argparse.Namespace) -> None:
 
     async with AsyncWebCrawler(config=browser_config) as crawler:
         for worksheet in worksheets:
-            headers = ensure_output_columns_exist(worksheet, read_header_map(worksheet))
+            headers = read_header_map(worksheet)
+            headers = remove_output_columns(worksheet, headers, REMOVED_OUTPUT_COLUMNS)
+            headers = ensure_output_columns_exist(worksheet, headers)
             url_key = detect_url_column(headers, args.url_column)
             url_col = headers[url_key]
             workbook.save(excel_path)
@@ -247,7 +260,7 @@ async def process_rows(args: argparse.Namespace) -> None:
 
                 try:
                     print(f"[CRAWL] Row {row_number}: {url}")
-                    markdown_text, markdown_type = await crawl_one_url(crawler, url, run_config)
+                    markdown_text = await crawl_one_url(crawler, url, run_config)
                     markdown_file = save_markdown_file(markdown_text, output_dir, url, row_number)
                     update_worksheet_row(
                         worksheet,
@@ -255,9 +268,6 @@ async def process_rows(args: argparse.Namespace) -> None:
                         headers,
                         markdown_path=relative_to_workbook(excel_path, markdown_file),
                         scrape_status="success",
-                        scraped_at=datetime.now().isoformat(timespec="seconds"),
-                        scrape_error="",
-                        markdown_type=markdown_type,
                     )
                     summary["success"] += 1
                 except Exception as exc:
@@ -267,9 +277,6 @@ async def process_rows(args: argparse.Namespace) -> None:
                         headers,
                         markdown_path="",
                         scrape_status="failed",
-                        scraped_at=datetime.now().isoformat(timespec="seconds"),
-                        scrape_error=str(exc),
-                        markdown_type="",
                     )
                     summary["failed"] += 1
                     print(f"[FAIL] Row {row_number}: {url} -> {exc}")
