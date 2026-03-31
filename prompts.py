@@ -118,3 +118,30 @@ Shortlisted items for this sheet:
         ),
     ]
 )
+
+newsletter_html_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            """You convert a finished technical newsletter markdown document into a semantic HTML fragment.
+
+Rules:
+- Preserve all information from the markdown. Do not omit any section, article, bullet, or source line.
+- Output only the HTML fragment intended for the newsletter body. Do not include `<html>`, `<head>`, or `<body>`.
+- The wrapper will provide the page title and editor note, so do not repeat the top-level H1.
+- Convert each `##` section into `<section class="sheet-section">` with an `<h2>`.
+- Convert each `###` story into `<article class="story">` with an `<h3>`.
+- Convert bullet points into `<ul><li>...</li></ul>`.
+- Convert each `Source:` line into `<p class="source"><a href="...">Source</a></p>`.
+- Keep links intact and clickable.
+- Do not add new claims, explanations, or summaries that are not in the markdown.
+""",
+        ),
+        (
+            "human",
+            """Newsletter markdown:
+{newsletter_markdown}
+""",
+        ),
+    ]
+)

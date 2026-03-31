@@ -1,11 +1,12 @@
 # Vision
 
 ## Goal
-This project should support a four-stage pipeline:
+This project should support a five-stage pipeline:
 1. download and filter sitemap URLs into Excel
 2. read those Excel URLs, crawl each page, save markdown locally, and write the markdown path back into the workbook
 3. route scraped markdown against a user need, save relevant rewritten markdown locally, and write the processed path back into the workbook
 4. batch selected processed markdown files sheet by sheet and generate a final technical-newsletter markdown file
+5. convert the final newsletter markdown into one styled standalone HTML newsletter file
 
 ## Current Workflow
 1. Update the source list and cutoff date in `sitemap_date_finder.py` when needed.
@@ -25,7 +26,8 @@ This project should support a four-stage pipeline:
 15. The third-stage script saves the workbook after every processed row so it can resume safely.
 16. Run `python build_final_newsletter.py` to read the selected processed markdown files from the workbook, shortlist the strongest news sheet by sheet in batches of 5, and write one final markdown newsletter under `recent_sitemap_outputs/final_newsletters/`.
 17. The newsletter stage keeps only news with strong evidence, technical grounding, breakthrough technology, or significant automobile-technology issues, and drops weaker or repetitive items again before writing the final markdown.
-18. If one site fails to download, one page fails to crawl, or one LLM call fails, the relevant script logs the error and continues with the rest.
+18. Run `python export_newsletter_html.py` to convert the final markdown newsletter into a styled standalone HTML file in the same output folder.
+19. If one site fails to download, one page fails to crawl, or one LLM call fails, the relevant script logs the error and continues with the rest.
 
 ## Active Sources
 - `https://www.motortrend.com/`
@@ -38,6 +40,7 @@ This project should support a four-stage pipeline:
 - `scrape_excel_urls_to_markdown.py`: Stage-two Excel-to-markdown crawler.
 - `semantic_router.py`: Stage-three semantic selection and rewrite script.
 - `build_final_newsletter.py`: Stage-four newsletter builder that curates selected processed markdown files into one final markdown newsletter.
+- `export_newsletter_html.py`: Stage-five HTML exporter that converts the final markdown newsletter into a styled standalone HTML file.
 - `prompts.py`: Shared LangChain prompt template for semantic routing.
 - `.env`: Local runtime configuration for the semantic router, including the OpenAI API key, model name, and user need prompt.
 - `requirements.txt`: Python dependencies for the project.
@@ -47,6 +50,7 @@ This project should support a four-stage pipeline:
 - `scraped_markdown/`: Default runtime folder for saved markdown files.
 - `processed_selected_markdown/`: Default runtime folder for saved processed markdown files.
 - `recent_sitemap_outputs/final_newsletters/`: Runtime folder for generated final newsletter markdown files.
+- `recent_sitemap_outputs/final_newsletters/`: Runtime folder for generated final newsletter markdown and HTML files.
 
 ## Maintenance Rule
 Whenever any code or workflow changes, update this file in the same change.
@@ -90,4 +94,6 @@ Always update:
 - Added `build_final_newsletter.py` as a fourth-stage script that processes selected markdown files sheet by sheet in batches of 5 and produces one final markdown newsletter with only the strongest technical news.
 - Added newsletter-builder prompt templates to `prompts.py`.
 - Added `recent_sitemap_outputs/final_newsletters/` to `.gitignore`.
+- Added `export_newsletter_html.py` as a fifth-stage script that converts the final markdown newsletter into one styled standalone HTML newsletter file.
+- Added an HTML-export prompt template to `prompts.py`.
 - Added `processed_selected_markdown/` to `.gitignore`.
