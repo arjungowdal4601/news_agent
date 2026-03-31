@@ -186,20 +186,26 @@ def chunk_items(items: list[dict[str, object]], size: int) -> list[list[dict[str
     return [items[index : index + size] for index in range(0, len(items), size)]
 
 
-def init_model() -> ChatOpenAI:
-    api_key = normalize_text(os.getenv("NEWS_AGENT_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY"))
-    if not api_key:
+def init_model(
+    *,
+    api_key: str | None = None,
+    model_name: str | None = None,
+    base_url: str | None = None,
+) -> ChatOpenAI:
+    resolved_api_key = normalize_text(api_key or os.getenv("NEWS_AGENT_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY"))
+    if not resolved_api_key:
         raise EnvironmentError("Set OPENAI_API_KEY or NEWS_AGENT_OPENAI_API_KEY before running build_final_newsletter.py.")
 
-    base_url = normalize_text(os.getenv("NEWS_AGENT_OPENAI_BASE_URL") or os.getenv("OPENAI_BASE_URL"))
+    resolved_model = normalize_text(model_name or DEFAULT_MODEL) or DEFAULT_MODEL
+    resolved_base_url = normalize_text(base_url or os.getenv("NEWS_AGENT_OPENAI_BASE_URL") or os.getenv("OPENAI_BASE_URL"))
     model_kwargs = {
-        "model": DEFAULT_MODEL,
-        "api_key": api_key,
+        "model": resolved_model,
+        "api_key": resolved_api_key,
         "max_retries": 2,
         "timeout": 120,
     }
-    if base_url:
-        model_kwargs["base_url"] = base_url
+    if resolved_base_url:
+        model_kwargs["base_url"] = resolved_base_url
     return ChatOpenAI(**model_kwargs)
 
 
@@ -208,10 +214,6 @@ def build_batch_chain(model: ChatOpenAI):
         BATCH_SELECTION_SCHEMA,
         method="function_calling",
     )
-
-
-def build_final_chain(model: ChatOpenAI):
-    return final_newsletter_prompt | model
 
 
 def collect_selected_articles(excel_path: Path, worksheet) -> list[dict[str, object]]:
@@ -311,30 +313,6 @@ def shortlist_batch(chain, sheet_name: str, batch_articles: list[dict[str, objec
     return shortlisted
 
 
-def format_shortlisted_items(shortlisted_items: list[dict[str, object]]) -> str:
-    blocks = []
-    for item in shortlisted_items:
-        evidence_points = item.get("evidence_points", [])
-        evidence_text = "\n".join(f"- {point}" for point in evidence_points) if evidence_points else "- No evidence points returned."
-        blocks.append(
-            "\n".join(
-                [
-                    f'Sheet: {item["sheet_name"]}',
-                    f'Article ID: {item["article_id"]}',
-                    f'Newsletter title: {item["newsletter_title"]}',
-                    f'Source URL: {item["source_url"]}',
-                    f'Relevance Score: {item["relevance_score"]}',
-                    f'Why keep: {item["why_keep"]}',
-                    "Evidence points:",
-                    evidence_text,
-                    "Processed markdown:",
-                    str(item["markdown_text"]),
-                ]
-            )
-        )
-    return "\n\n---\n\n".join(blocks)
-
-
 def format_sheet_section(shortlisted_items: list[dict[str, object]], sheet_name: str) -> str:
     lines = [f"## {sheet_name}", ""]
     if not shortlisted_items:
@@ -381,41 +359,68 @@ def save_final_newsletter(output_dir: Path, final_markdown: str) -> Path:
     return output_path
 
 
+def run_newsletter_stage(
+    *,
+    excel_path: Path | str = DEFAULT_EXCEL_PATH,
+    sheet_name: str | None = None,
+    output_dir: Path | str = DEFAULT_OUTPUT_DIR,
+    api_key: str | None = None,
+    model_name: str | None = None,
+    base_url: str | None = None,
+    force_rebuild: bool = True,
+) -> bool:
+    resolved_excel_path = Path(excel_path).resolve()
+    if not resolved_excel_path.exists():
+        raise FileNotFoundError(f"Excel workbook not found: {resolved_excel_path}")
+
+    resolved_output_dir = resolve_output_dir(str(output_dir))
+    output_path = resolved_output_dir / FINAL_NEWSLETTER_FILENAME
+    if output_path.exists() and not force_rebuild:
+        print(f"[SKIP] Final newsletter already exists: {output_path}")
+        return False
+
+    workbook, worksheets = load_workbook_and_sheets(resolved_excel_path, sheet_name)
+    try:
+        model = init_model(api_key=api_key, model_name=model_name, base_url=base_url)
+        batch_chain = build_batch_chain(model)
+        shortlisted_items: list[dict[str, object]] = []
+        for worksheet in worksheets:
+            articles = collect_selected_articles(resolved_excel_path, worksheet)
+            if not articles:
+                continue
+
+            print(f"\n[SHEET] {worksheet.title} | selected_articles={len(articles)}")
+            for batch_number, batch_articles in enumerate(chunk_items(articles, BATCH_SIZE), start=1):
+                print(f"[BATCH] {worksheet.title} | batch={batch_number} | size={len(batch_articles)}")
+                shortlisted_items.extend(shortlist_batch(batch_chain, worksheet.title, batch_articles))
+
+        if not shortlisted_items:
+            raise RuntimeError("No newsletter-worthy items were shortlisted from the selected processed markdown files.")
+
+        sheet_sections: list[str] = []
+        for worksheet in worksheets:
+            sheet_items = [item for item in shortlisted_items if item["sheet_name"] == worksheet.title]
+            if not sheet_items:
+                continue
+            sheet_sections.append(format_sheet_section(sheet_items, worksheet.title))
+
+        final_markdown = build_final_document(sheet_sections)
+        save_final_newsletter(resolved_output_dir, final_markdown)
+        print(f"\n[DONE] Final newsletter saved to: {output_path}")
+        print(f"[DONE] Shortlisted items used: {len(shortlisted_items)}")
+        return True
+    finally:
+        workbook.close()
+
+
 def main() -> None:
     args = parse_args()
-    excel_path = Path(args.excel_path).resolve()
-    if not excel_path.exists():
-        raise FileNotFoundError(f"Excel workbook not found: {excel_path}")
-
-    output_dir = resolve_output_dir(args.output_dir)
-    workbook, worksheets = load_workbook_and_sheets(excel_path, args.sheet_name)
-    model = init_model()
-    batch_chain = build_batch_chain(model)
-    shortlisted_items: list[dict[str, object]] = []
-    for worksheet in worksheets:
-        articles = collect_selected_articles(excel_path, worksheet)
-        if not articles:
-            continue
-
-        print(f"\n[SHEET] {worksheet.title} | selected_articles={len(articles)}")
-        for batch_number, batch_articles in enumerate(chunk_items(articles, BATCH_SIZE), start=1):
-            print(f"[BATCH] {worksheet.title} | batch={batch_number} | size={len(batch_articles)}")
-            shortlisted_items.extend(shortlist_batch(batch_chain, worksheet.title, batch_articles))
-
-    if not shortlisted_items:
-        raise RuntimeError("No newsletter-worthy items were shortlisted from the selected processed markdown files.")
-
-    sheet_sections: list[str] = []
-    for worksheet in worksheets:
-        sheet_items = [item for item in shortlisted_items if item["sheet_name"] == worksheet.title]
-        if not sheet_items:
-            continue
-        sheet_sections.append(format_sheet_section(sheet_items, worksheet.title))
-
-    final_markdown = build_final_document(sheet_sections)
-    output_path = save_final_newsletter(output_dir, final_markdown)
-    print(f"\n[DONE] Final newsletter saved to: {output_path}")
-    print(f"[DONE] Shortlisted items used: {len(shortlisted_items)}")
+    run_newsletter_stage(
+        excel_path=args.excel_path,
+        sheet_name=args.sheet_name,
+        output_dir=args.output_dir,
+        force_rebuild=True,
+    )
 
 
 if __name__ == "__main__":

@@ -16,9 +16,7 @@ from prompts import semantic_router_prompt
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 
-USER_NEED = os.getenv("USER_NEED", "REPLACE THIS WITH WHAT YOU NEED")
-
-
+DEFAULT_USER_NEED = os.getenv("USER_NEED", "REPLACE THIS WITH WHAT YOU NEED")
 DEFAULT_EXCEL_PATH = Path("recent_sitemap_outputs") / "recent_urls.xlsx"
 DEFAULT_OUTPUT_DIR = "processed_selected_markdown"
 DEFAULT_MODEL = os.getenv("NEWS_AGENT_LLM_MODEL", "gpt-5.4-nano")
@@ -149,8 +147,9 @@ def detect_column(
     raise ValueError(f"Could not auto-detect a {label}. Available headers: {sorted(headers)}")
 
 
-def ensure_output_columns_exist(worksheet, headers: dict[str, int]) -> dict[str, int]:
+def ensure_output_columns_exist(worksheet, headers: dict[str, int]) -> tuple[dict[str, int], bool]:
     next_col = worksheet.max_column + 1
+    changed = False
     for column_name in OUTPUT_COLUMNS:
         key = normalize_header(column_name)
         if key in headers:
@@ -158,7 +157,8 @@ def ensure_output_columns_exist(worksheet, headers: dict[str, int]) -> dict[str,
         worksheet.cell(row=1, column=next_col, value=column_name)
         headers[key] = next_col
         next_col += 1
-    return headers
+        changed = True
+    return headers, changed
 
 
 def resolve_output_dir(excel_path: Path, output_dir_arg: str) -> Path:
@@ -257,28 +257,33 @@ def strip_fences(text: str) -> str:
     return cleaned.strip()
 
 
-def ensure_user_need_is_configured() -> str:
-    need = normalize_text(USER_NEED)
+def ensure_user_need_is_configured(user_need: str | None = None) -> str:
+    need = normalize_text(user_need or DEFAULT_USER_NEED)
     if not need or "REPLACE THIS WITH WHAT YOU NEED" in need.upper():
-        raise ValueError("Update USER_NEED in semantic_router.py before running the script.")
+        raise ValueError("Update USER_NEED in .env before running the script.")
     return need
 
 
-def init_model() -> ChatOpenAI:
-    api_key = os.getenv("NEWS_AGENT_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
-    if not api_key:
+def init_model(
+    *,
+    api_key: str | None = None,
+    model_name: str | None = None,
+    base_url: str | None = None,
+) -> ChatOpenAI:
+    resolved_api_key = normalize_text(api_key or os.getenv("NEWS_AGENT_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY"))
+    if not resolved_api_key:
         raise EnvironmentError("Set OPENAI_API_KEY or NEWS_AGENT_OPENAI_API_KEY before running semantic_router.py.")
 
-    model_name = os.getenv("NEWS_AGENT_LLM_MODEL", DEFAULT_MODEL)
-    base_url = os.getenv("NEWS_AGENT_OPENAI_BASE_URL") or os.getenv("OPENAI_BASE_URL")
+    resolved_model = normalize_text(model_name or os.getenv("NEWS_AGENT_LLM_MODEL", DEFAULT_MODEL)) or DEFAULT_MODEL
+    resolved_base_url = normalize_text(base_url or os.getenv("NEWS_AGENT_OPENAI_BASE_URL") or os.getenv("OPENAI_BASE_URL"))
     model_kwargs = {
-        "model": model_name,
-        "api_key": api_key,
+        "model": resolved_model,
+        "api_key": resolved_api_key,
         "max_retries": 2,
         "timeout": 120,
     }
-    if base_url:
-        model_kwargs["base_url"] = base_url
+    if resolved_base_url:
+        model_kwargs["base_url"] = resolved_base_url
     return ChatOpenAI(**model_kwargs)
 
 
@@ -381,7 +386,7 @@ def append_selected_images(
         alt_text = image["alt_text"] or "Relevant image"
         image_blocks.append(f'![{alt_text}]({image["url"]})')
         if image["context"] and image["context"] != alt_text:
-            image_blocks.append(f"*Source context: {image['context']}*")
+            image_blocks.append(f'*Source context: {image["context"]}*')
 
     return processed_markdown.rstrip() + "\n\n## Relevant Images\n\n" + "\n\n".join(image_blocks)
 
@@ -418,15 +423,25 @@ def print_summary(summary: dict[str, int]) -> None:
     print(f"skipped existing rows: {summary['skipped_existing']}")
 
 
-def process_rows(args: argparse.Namespace) -> None:
-    excel_path = Path(args.excel_path).resolve()
-    if not excel_path.exists():
-        raise FileNotFoundError(f"Excel workbook not found: {excel_path}")
+def run_route_stage(
+    *,
+    excel_path: Path | str = DEFAULT_EXCEL_PATH,
+    sheet_name: str | None = None,
+    output_dir: str = DEFAULT_OUTPUT_DIR,
+    force_reprocess: bool = False,
+    user_need: str | None = None,
+    api_key: str | None = None,
+    model_name: str | None = None,
+    base_url: str | None = None,
+) -> bool:
+    resolved_excel_path = Path(excel_path).resolve()
+    if not resolved_excel_path.exists():
+        raise FileNotFoundError(f"Excel workbook not found: {resolved_excel_path}")
 
-    need = ensure_user_need_is_configured()
-    output_dir = resolve_output_dir(excel_path, args.output_dir)
-    workbook, worksheets = load_workbook_and_sheets(excel_path, args.sheet_name)
-    chain = build_router_chain(init_model())
+    need = ensure_user_need_is_configured(user_need)
+    resolved_output_dir = resolve_output_dir(resolved_excel_path, output_dir)
+    workbook, worksheets = load_workbook_and_sheets(resolved_excel_path, sheet_name)
+    chain = build_router_chain(init_model(api_key=api_key, model_name=model_name, base_url=base_url))
     summary = {
         "checked": 0,
         "matched_yes": 0,
@@ -437,9 +452,11 @@ def process_rows(args: argparse.Namespace) -> None:
         "failed": 0,
         "skipped_existing": 0,
     }
+    schema_changed = False
 
     for worksheet in worksheets:
-        headers = ensure_output_columns_exist(worksheet, read_header_map(worksheet))
+        headers, added = ensure_output_columns_exist(worksheet, read_header_map(worksheet))
+        schema_changed = schema_changed or added
         url_key = detect_column(
             headers,
             URL_COLUMN_CANDIDATES,
@@ -452,7 +469,7 @@ def process_rows(args: argparse.Namespace) -> None:
             contains_groups=(("markdown", "path"), ("md", "path")),
             label="markdown path column",
         )
-        workbook.save(excel_path)
+        workbook.save(resolved_excel_path)
         print(f"\n[SHEET] {worksheet.title} | url_column={url_key} | markdown_column={markdown_key}")
 
         for row_number in range(2, worksheet.max_row + 1):
@@ -466,8 +483,8 @@ def process_rows(args: argparse.Namespace) -> None:
             processed_markdown_path = worksheet.cell(row=row_number, column=headers["processed_markdown_path"]).value
 
             if should_skip_row(
-                args.force_reprocess,
-                excel_path,
+                force_reprocess,
+                resolved_excel_path,
                 semantic_match,
                 processed_save_status,
                 processed_markdown_path,
@@ -488,11 +505,11 @@ def process_rows(args: argparse.Namespace) -> None:
                     processed_markdown_path="",
                 )
                 summary["missing_markdown_path"] += 1
-                workbook.save(excel_path)
+                workbook.save(resolved_excel_path)
                 print(f"[MISS] Row {row_number}: {url} -> markdown_path is empty")
                 continue
 
-            source_markdown_path = resolve_existing_file(excel_path, markdown_path_value)
+            source_markdown_path = resolve_existing_file(resolved_excel_path, markdown_path_value)
             if source_markdown_path is None:
                 update_worksheet_row(
                     worksheet,
@@ -504,7 +521,7 @@ def process_rows(args: argparse.Namespace) -> None:
                     processed_markdown_path="",
                 )
                 summary["missing_markdown_file"] += 1
-                workbook.save(excel_path)
+                workbook.save(resolved_excel_path)
                 print(f"[MISS] Row {row_number}: {url} -> markdown file not found")
                 continue
 
@@ -546,8 +563,8 @@ def process_rows(args: argparse.Namespace) -> None:
                         raise RuntimeError("The model marked the article as relevant but returned empty processed markdown.")
 
                     saved_path = save_processed_markdown(
-                        excel_path,
-                        output_dir,
+                        resolved_excel_path,
+                        resolved_output_dir,
                         worksheet.title,
                         row_number,
                         url,
@@ -578,14 +595,24 @@ def process_rows(args: argparse.Namespace) -> None:
                 summary["failed"] += 1
                 print(f"[FAIL] Row {row_number}: {url} -> {exc}")
             finally:
-                workbook.save(excel_path)
+                workbook.save(resolved_excel_path)
 
     print_summary(summary)
+    workbook.close()
+    return schema_changed or any(
+        summary[key] > 0
+        for key in ("matched_yes", "matched_no", "saved", "missing_markdown_path", "missing_markdown_file", "failed")
+    )
 
 
 def main() -> None:
     args = parse_args()
-    process_rows(args)
+    run_route_stage(
+        excel_path=args.excel_path,
+        sheet_name=args.sheet_name,
+        output_dir=args.output_dir,
+        force_reprocess=args.force_reprocess,
+    )
 
 
 if __name__ == "__main__":

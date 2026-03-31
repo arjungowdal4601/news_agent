@@ -49,42 +49,48 @@ def normalize_text(value: object) -> str:
 
 def repair_mojibake(text: str) -> str:
     repaired = text
-    suspicious_tokens = ("â€", "â€™", "â€œ", "â€", "â€“", "â€”", "Â", "Å‚")
+    suspicious_tokens = ("Ã¢â‚¬", "Ã¢â‚¬â„¢", "Ã¢â‚¬Å“", "Ã¢â‚¬Â", "Ã¢â‚¬â€œ", "Ã¢â‚¬â€", "Ã‚", "Ã…â€š")
     if any(token in repaired for token in suspicious_tokens):
         try:
             candidate = repaired.encode("latin-1", errors="ignore").decode("utf-8", errors="ignore")
-            if candidate and candidate.count("â") < repaired.count("â"):
+            if candidate and candidate.count("Ã¢") < repaired.count("Ã¢"):
                 repaired = candidate
         except UnicodeError:
             pass
     replacements = {
-        "â€™": "'",
-        "â€œ": '"',
-        "â€": '"',
-        "â€“": "-",
-        "â€”": "-",
-        "Â ": " ",
-        "Â": "",
+        "Ã¢â‚¬â„¢": "'",
+        "Ã¢â‚¬Å“": '"',
+        "Ã¢â‚¬Â": '"',
+        "Ã¢â‚¬â€œ": "-",
+        "Ã¢â‚¬â€": "-",
+        "Ã‚ ": " ",
+        "Ã‚": "",
     }
     for bad, good in replacements.items():
         repaired = repaired.replace(bad, good)
     return repaired
 
 
-def init_model() -> ChatOpenAI:
-    api_key = normalize_text(os.getenv("NEWS_AGENT_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY"))
-    if not api_key:
+def init_model(
+    *,
+    api_key: str | None = None,
+    model_name: str | None = None,
+    base_url: str | None = None,
+) -> ChatOpenAI:
+    resolved_api_key = normalize_text(api_key or os.getenv("NEWS_AGENT_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY"))
+    if not resolved_api_key:
         raise EnvironmentError("Set OPENAI_API_KEY or NEWS_AGENT_OPENAI_API_KEY before running export_newsletter_html.py.")
 
-    base_url = normalize_text(os.getenv("NEWS_AGENT_OPENAI_BASE_URL") or os.getenv("OPENAI_BASE_URL"))
+    resolved_model = normalize_text(model_name or DEFAULT_HTML_MODEL) or DEFAULT_HTML_MODEL
+    resolved_base_url = normalize_text(base_url or os.getenv("NEWS_AGENT_OPENAI_BASE_URL") or os.getenv("OPENAI_BASE_URL"))
     model_kwargs = {
-        "model": DEFAULT_HTML_MODEL,
-        "api_key": api_key,
+        "model": resolved_model,
+        "api_key": resolved_api_key,
         "max_retries": 2,
         "timeout": 120,
     }
-    if base_url:
-        model_kwargs["base_url"] = base_url
+    if resolved_base_url:
+        model_kwargs["base_url"] = resolved_base_url
     return ChatOpenAI(**model_kwargs)
 
 
@@ -265,22 +271,42 @@ def wrap_html_document(title: str, editor_note: str, body_html: str) -> str:
 """
 
 
-def main() -> None:
-    args = parse_args()
-    input_markdown_path = Path(args.input_markdown).resolve()
-    output_html_path = Path(args.output_html).resolve()
+def run_html_stage(
+    *,
+    input_markdown: Path | str = DEFAULT_INPUT_MARKDOWN,
+    output_html: Path | str = DEFAULT_OUTPUT_HTML,
+    api_key: str | None = None,
+    model_name: str | None = None,
+    base_url: str | None = None,
+    force_rebuild: bool = True,
+) -> bool:
+    input_markdown_path = Path(input_markdown).resolve()
+    output_html_path = Path(output_html).resolve()
 
     if not input_markdown_path.exists():
         raise FileNotFoundError(f"Newsletter markdown not found: {input_markdown_path}")
+    if output_html_path.exists() and not force_rebuild:
+        print(f"[SKIP] HTML newsletter already exists: {output_html_path}")
+        return False
 
     output_html_path.parent.mkdir(parents=True, exist_ok=True)
     newsletter_markdown = repair_mojibake(input_markdown_path.read_text(encoding="utf-8"))
     title = extract_title(newsletter_markdown)
     editor_note = extract_editor_note(newsletter_markdown)
-    body_html = build_html_body(init_model(), newsletter_markdown)
+    body_html = build_html_body(init_model(api_key=api_key, model_name=model_name, base_url=base_url), newsletter_markdown)
     final_html = wrap_html_document(title, editor_note, body_html)
     output_html_path.write_text(final_html, encoding="utf-8")
     print(f"[DONE] HTML newsletter saved to: {output_html_path}")
+    return True
+
+
+def main() -> None:
+    args = parse_args()
+    run_html_stage(
+        input_markdown=args.input_markdown,
+        output_html=args.output_html,
+        force_rebuild=True,
+    )
 
 
 if __name__ == "__main__":

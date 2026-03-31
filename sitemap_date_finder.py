@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import gzip
 import re
+import warnings
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -10,7 +11,10 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
+from requests.exceptions import RequestsDependencyWarning
 from openpyxl import Workbook
+
+warnings.filterwarnings("ignore", category=RequestsDependencyWarning)
 
 try:
     from curl_cffi import requests as curl_requests
@@ -162,9 +166,9 @@ def walk(root: ET.Element, session: requests.Session, cutoff: date, writer: csv.
             print(f"[WARN] Could not open child sitemap: {child_url} -> {exc}")
 
 
-def process_file(path: Path, workbook: Workbook, session: requests.Session, cutoff: date) -> tuple[Path, bool]:
+def process_file(path: Path, workbook: Workbook, session: requests.Session, cutoff: date, output_dir: Path) -> tuple[Path, bool]:
     stem = re.sub(r"[^A-Za-z0-9_-]+", "_", path.stem).strip("_") or "output"
-    csv_path = OUTPUT_DIR / f"{stem}_after_{cutoff.isoformat()}.csv"
+    csv_path = output_dir / f"{stem}_after_{cutoff.isoformat()}.csv"
     sheet = workbook.create_sheet(title=stem[:31])
     sheet.append(["link", "lastmod"])
     stats = Stats()
@@ -181,11 +185,11 @@ def process_file(path: Path, workbook: Workbook, session: requests.Session, cuto
     return csv_path, stats.truncated
 
 
-def download_top_level_sitemaps(session: requests.Session) -> list[Path]:
+def download_top_level_sitemaps(session: requests.Session, download_dir: Path) -> list[Path]:
     files: list[Path] = []
     for base_url in BASE_URLS:
         sitemap_url = base_url.rstrip("/") + "/sitemap.xml"
-        path = DOWNLOAD_DIR / file_name(base_url)
+        path = download_dir / file_name(base_url)
         try:
             path.write_bytes(fetch_bytes(sitemap_url, session))
             print(f"[FETCH] {sitemap_url} -> {path}")
@@ -195,28 +199,43 @@ def download_top_level_sitemaps(session: requests.Session) -> list[Path]:
     return files
 
 
-def main() -> None:
-    DOWNLOAD_DIR.mkdir(exist_ok=True)
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    cutoff = date.fromisoformat(CUTOFF_DATE_TEXT)
+def run_sitemap_stage(
+    *,
+    cutoff_date: date | str = CUTOFF_DATE_TEXT,
+    workbook_path: Path | str = EXCEL_PATH,
+    download_dir: Path | str = DOWNLOAD_DIR,
+    output_dir: Path | str | None = None,
+    force: bool = True,
+) -> bool:
+    workbook_path = Path(workbook_path).resolve()
+    download_dir = Path(download_dir).resolve()
+    output_dir = Path(output_dir).resolve() if output_dir is not None else workbook_path.parent.resolve()
+    cutoff = cutoff_date if isinstance(cutoff_date, date) else date.fromisoformat(str(cutoff_date))
+
+    if workbook_path.exists() and not force:
+        print(f"[SKIP] Excel workbook already exists: {workbook_path}")
+        return False
+
+    download_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
     workbook = Workbook()
     workbook.remove(workbook.active)
 
     with requests.Session() as session:
         session.headers.update(HEADERS)
-        files = download_top_level_sitemaps(session)
+        files = download_top_level_sitemaps(session, download_dir)
         if not files:
             print("[ERROR] No sitemap files were downloaded.")
-            return
+            return False
         csv_outputs: list[tuple[Path, bool]] = []
         for path in files:
             try:
-                csv_outputs.append(process_file(path, workbook, session, cutoff))
+                csv_outputs.append(process_file(path, workbook, session, cutoff, output_dir))
             except Exception as exc:
                 print(f"[ERROR] Failed to process {path.name}: {exc}")
 
-    workbook.save(EXCEL_PATH)
-    print(f"[DONE] Excel workbook saved to: {EXCEL_PATH}")
+    workbook.save(workbook_path)
+    print(f"[DONE] Excel workbook saved to: {workbook_path}")
 
     for csv_path, truncated in csv_outputs:
         if truncated:
@@ -227,6 +246,12 @@ def main() -> None:
             print(f"[CLEANUP] Deleted merged CSV: {csv_path}")
         except Exception as exc:
             print(f"[WARN] Could not delete CSV {csv_path}: {exc}")
+
+    return True
+
+
+def main() -> None:
+    run_sitemap_stage(force=True)
 
 
 if __name__ == "__main__":

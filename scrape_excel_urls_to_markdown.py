@@ -113,8 +113,9 @@ def detect_url_column(headers: dict[str, int], url_column: str | None) -> str:
     raise ValueError(f"Could not auto-detect a URL column. Available headers: {sorted(headers)}")
 
 
-def ensure_output_columns_exist(worksheet, headers: dict[str, int]) -> dict[str, int]:
+def ensure_output_columns_exist(worksheet, headers: dict[str, int]) -> tuple[dict[str, int], bool]:
     next_col = worksheet.max_column + 1
+    changed = False
     for column_name in OUTPUT_COLUMNS:
         key = normalize_header(column_name)
         if key in headers:
@@ -122,17 +123,20 @@ def ensure_output_columns_exist(worksheet, headers: dict[str, int]) -> dict[str,
         worksheet.cell(row=1, column=next_col, value=column_name)
         headers[key] = next_col
         next_col += 1
-    return headers
+        changed = True
+    return headers, changed
 
 
-def remove_output_columns(worksheet, headers: dict[str, int], column_names: list[str]) -> dict[str, int]:
+def remove_output_columns(worksheet, headers: dict[str, int], column_names: list[str]) -> tuple[dict[str, int], bool]:
     columns_to_delete = sorted(
         (headers[normalize_header(column_name)] for column_name in column_names if normalize_header(column_name) in headers),
         reverse=True,
     )
+    if not columns_to_delete:
+        return headers, False
     for column_index in columns_to_delete:
         worksheet.delete_cols(column_index)
-    return read_header_map(worksheet)
+    return read_header_map(worksheet), True
 
 
 def resolve_output_dir(excel_path: Path, output_dir_arg: str) -> Path:
@@ -220,23 +224,32 @@ def relative_to_workbook(excel_path: Path, file_path: Path) -> str:
     return Path(os.path.relpath(file_path, start=excel_path.parent)).as_posix()
 
 
-async def process_rows(args: argparse.Namespace) -> None:
-    excel_path = Path(args.excel_path).resolve()
+async def process_rows(
+    *,
+    excel_path: Path,
+    sheet_name: str | None,
+    url_column: str | None,
+    output_dir_arg: str,
+    force_rescrape: bool,
+    headless: bool,
+) -> bool:
     if not excel_path.exists():
         raise FileNotFoundError(f"Excel workbook not found: {excel_path}")
 
-    output_dir = resolve_output_dir(excel_path, args.output_dir)
-    workbook, worksheets = load_workbook_and_sheets(excel_path, args.sheet_name)
-    browser_config = BrowserConfig(headless=args.headless)
+    output_dir = resolve_output_dir(excel_path, output_dir_arg)
+    workbook, worksheets = load_workbook_and_sheets(excel_path, sheet_name)
+    browser_config = BrowserConfig(headless=headless)
     run_config = build_run_config()
     summary = {"checked": 0, "success": 0, "failed": 0, "skipped": 0}
+    schema_changed = False
 
     async with AsyncWebCrawler(config=browser_config) as crawler:
         for worksheet in worksheets:
             headers = read_header_map(worksheet)
-            headers = remove_output_columns(worksheet, headers, REMOVED_OUTPUT_COLUMNS)
-            headers = ensure_output_columns_exist(worksheet, headers)
-            url_key = detect_url_column(headers, args.url_column)
+            headers, removed = remove_output_columns(worksheet, headers, REMOVED_OUTPUT_COLUMNS)
+            headers, added = ensure_output_columns_exist(worksheet, headers)
+            schema_changed = schema_changed or removed or added
+            url_key = detect_url_column(headers, url_column)
             url_col = headers[url_key]
             workbook.save(excel_path)
             print(f"\n[SHEET] {worksheet.title} | url_column={url_key}")
@@ -252,7 +265,7 @@ async def process_rows(args: argparse.Namespace) -> None:
                     worksheet.cell(row=row_number, column=headers["markdown_path"]).value,
                 )
 
-                if saved_file and not args.force_rescrape:
+                if saved_file and not force_rescrape:
                     summary["skipped"] += 1
                     print(f"[SKIP] Row {row_number}: {url}")
                     workbook.save(excel_path)
@@ -288,11 +301,41 @@ async def process_rows(args: argparse.Namespace) -> None:
     print(f"successful scrapes: {summary['success']}")
     print(f"failed scrapes: {summary['failed']}")
     print(f"skipped rows: {summary['skipped']}")
+    workbook.close()
+    return schema_changed or summary["success"] > 0 or summary["failed"] > 0
+
+
+def run_scrape_stage(
+    *,
+    excel_path: Path | str = DEFAULT_EXCEL_PATH,
+    sheet_name: str | None = None,
+    url_column: str | None = None,
+    output_dir: str = "scraped_markdown",
+    force_rescrape: bool = False,
+    headless: bool = True,
+) -> bool:
+    return asyncio.run(
+        process_rows(
+            excel_path=Path(excel_path).resolve(),
+            sheet_name=sheet_name,
+            url_column=url_column,
+            output_dir_arg=output_dir,
+            force_rescrape=force_rescrape,
+            headless=headless,
+        )
+    )
 
 
 def main() -> None:
     args = parse_args()
-    asyncio.run(process_rows(args))
+    run_scrape_stage(
+        excel_path=args.excel_path,
+        sheet_name=args.sheet_name,
+        url_column=args.url_column,
+        output_dir=args.output_dir,
+        force_rescrape=args.force_rescrape,
+        headless=args.headless,
+    )
 
 
 if __name__ == "__main__":
