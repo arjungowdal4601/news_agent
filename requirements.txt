@@ -2,3 +2,6 @@ requests
 openpyxl
 curl_cffi
 crawl4ai
+langchain-core
+langchain-openai
+python-dotenv

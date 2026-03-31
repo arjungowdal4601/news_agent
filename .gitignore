@@ -1,4 +1,7 @@
 # Python cache
 __pycache__/
 *.pyc
+.env
 scraped_markdown/
+processed_selected_markdown/
+recent_sitemap_outputs/final_newsletters/
